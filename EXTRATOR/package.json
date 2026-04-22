@@ -1,0 +1,15 @@
+{
+  "name": "extrator-fechas-js",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node extractor.js",
+    "start:demo": "set EXTRACTOR_ROOT_PATH=Z:/IA 10/NUEVO/PARTE3/890701715&& node extractor.js"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1"
+  }
+}

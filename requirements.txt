@@ -1,0 +1,7 @@
+rapidocr-onnxruntime
+numpy
+Pillow
+openpyxl
+pypdf
+pdf2image
+pypdfium2

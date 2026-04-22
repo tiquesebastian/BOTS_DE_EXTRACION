@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+
+# Generated outputs
+*.csv
+*.xlsx
+*.zip
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local input lists and ad-hoc files
+numeros_pendientes
+numeros_pendientes_50
+faltan estos radicados
