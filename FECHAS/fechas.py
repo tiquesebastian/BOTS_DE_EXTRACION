@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from openpyxl import Workbook
@@ -13,6 +16,11 @@ from pdf2image import convert_from_path
 from PIL import Image, ImageFilter, ImageOps
 from pypdf import PdfReader
 from rapidocr_onnxruntime import RapidOCR
+
+try:
+    import pypdfium2 as pdfium
+except Exception:
+    pdfium = None
 
 
 ROOT_PATH = Path(r"Z:\IA 10\NUEVO\PARTE3\890701715")
@@ -41,6 +49,9 @@ FILE_NAME_PRIORITY = [
     "orden",
 ]
 
+DEFAULT_FILE_KEYWORDS = ["otros", "factura", "resumen", "tapa", "urgencias"]
+DEFAULT_LABEL_KEYWORDS = ["ingreso", "atencion"]
+
 SUPPORTED_EXTENSIONS = {".pdf", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".gif"}
 DATE_PATTERN = re.compile(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{2,4})")
 ATENCION_PATTERN = re.compile(r"atencion\s*:?\s*(\d{8})\d*", re.IGNORECASE)
@@ -49,6 +60,21 @@ INGRESO_PATTERNS = [
     re.compile(r"ingreso.{0,240}?fecha.{0,60}?(\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4})", re.IGNORECASE),
     re.compile(r"ingreso.{0,240}?(\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4})", re.IGNORECASE),
 ]
+
+
+@dataclass
+class FechasConfig:
+    root_path: Path
+    target_radicados_path: Path
+    output_csv_path: Path
+    output_excel_path: Path
+    seed_result_paths: list[Path]
+    max_pdf_text_pages: int = MAX_PDF_TEXT_PAGES
+    max_ocr_pages: int = MAX_OCR_PAGES
+    max_files_per_radicado: int = MAX_FILES_PER_RADICADO
+    poppler_path: Path = POPPLER_PATH
+    file_name_keywords: list[str] | None = None
+    target_text_keywords: list[str] | None = None
 
 
 @dataclass
@@ -72,6 +98,22 @@ class OCRMatch:
     metodo: str
     motivo: str
     score_confianza: int
+
+
+@dataclass
+class ProgressInfo:
+    total_objetivos: int
+    total_pendientes_ocr: int
+    procesados_ocr: int
+    encontrados_exactos: int
+    encontrados_seed: int
+    no_encontrados: int
+    restantes_ocr: int
+    elapsed_seconds: float
+    average_seconds_per_item: float
+    eta_seconds: float
+    speed_label: str
+    current_radicado: str = ""
 
 
 def normalizar_clave(texto: str) -> str:
@@ -123,11 +165,32 @@ def format_fecha(dt: datetime) -> str:
     return f"{dt.day}/{dt.month:02d}/{dt.year % 100:02d}"
 
 
-def extraer_fecha_desde_texto(texto: str) -> tuple[str, str]:
+def normalizar_lista_keywords(texto: str) -> list[str]:
+    return [normalizar_clave(item) for item in (texto or "").split(",") if normalizar_clave(item)]
+
+
+def extraer_fecha_desde_texto(texto: str, label_keywords: list[str]) -> tuple[str, str]:
     limpio = re.sub(r"\s+", " ", (texto or "").replace("\x00", " "))
     clave = normalizar_clave(limpio)
     if not clave:
         return "", ""
+
+    keywords = [normalizar_clave(k) for k in (label_keywords or []) if normalizar_clave(k)]
+    if not keywords:
+        keywords = DEFAULT_LABEL_KEYWORDS
+
+    for keyword in keywords:
+        idx = clave.find(keyword)
+        if idx == -1:
+            continue
+        segmento = clave[max(0, idx - 30) : idx + 260]
+        m = DATE_PATTERN.search(segmento)
+        if m:
+            cruda = re.sub(r"\s+", "", m.group(0))
+            try:
+                return normalizar_fecha(cruda), cruda
+            except ValueError:
+                pass
 
     for patron in INGRESO_PATTERNS:
         m = patron.search(clave)
@@ -202,19 +265,50 @@ def cargar_resultados_seed() -> dict[str, str]:
     return seed
 
 
-def construir_lista_archivos(carpeta: Path) -> list[Path]:
+def cargar_resultados_seed_desde_rutas(seed_paths: list[Path]) -> dict[str, str]:
+    seed: dict[str, str] = {}
+    for ruta in seed_paths:
+        if not ruta.exists():
+            continue
+        with ruta.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames and "radicado" in [h.strip().lower() for h in reader.fieldnames]:
+                for row in reader:
+                    radicado = normalizar_radicado((row.get("radicado") or row.get("Radicado") or "").strip())
+                    ingreso = (row.get("ingreso") or row.get("Ingreso") or "").strip()
+                    ingreso = normalizar_fecha(ingreso) if ingreso else ""
+                    if radicado and ingreso:
+                        seed[radicado] = ingreso
+                continue
+
+        with ruta.open("r", encoding="utf-8-sig", errors="ignore") as f:
+            for linea in f:
+                linea = linea.strip()
+                if not linea or linea.lower().startswith("radicado"):
+                    continue
+                partes = linea.split(",", 1)
+                if len(partes) != 2:
+                    continue
+                radicado = normalizar_radicado(partes[0])
+                ingreso = normalizar_fecha(partes[1].strip())
+                if radicado and ingreso:
+                    seed[radicado] = ingreso
+    return seed
+
+
+def construir_lista_archivos(carpeta: Path, max_files: int, file_keywords: list[str]) -> list[Path]:
     candidatos = [
         p for p in carpeta.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
 
     def prioridad(archivo: Path) -> tuple[int, str]:
         nombre = normalizar_clave(archivo.name)
-        for i, token in enumerate(FILE_NAME_PRIORITY):
+        for i, token in enumerate(file_keywords):
             if token in nombre:
                 return i, nombre
-        return len(FILE_NAME_PRIORITY), nombre
+        return len(file_keywords), nombre
 
-    return sorted(candidatos, key=prioridad)[:MAX_FILES_PER_RADICADO]
+    return sorted(candidatos, key=prioridad)[:max_files]
 
 
 def preprocesar_imagen(imagen: Image.Image) -> np.ndarray:
@@ -235,47 +329,75 @@ def ocr_en_imagen(engine: RapidOCR, imagen: Image.Image) -> str:
     return " ".join(item[1] for item in resultado)
 
 
-def extraer_fecha_pdf(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
+def render_pdf_pages(archivo: Path, max_pages: int, poppler_path: Path) -> tuple[list[Image.Image], str]:
+    try:
+        paginas = convert_from_path(
+            str(archivo),
+            dpi=220,
+            first_page=1,
+            last_page=max_pages,
+            poppler_path=str(poppler_path) if poppler_path.exists() else None,
+        )
+        return paginas, "pdf2image"
+    except Exception:
+        pass
+
+    if pdfium is None:
+        return [], "sin_renderizador"
+
+    try:
+        doc = pdfium.PdfDocument(str(archivo))
+        paginas: list[Image.Image] = []
+        limite = min(len(doc), max_pages)
+        for i in range(limite):
+            page = doc[i]
+            bitmap = page.render(scale=220 / 72)
+            pil_img = bitmap.to_pil()
+            paginas.append(pil_img)
+        return paginas, "pypdfium2"
+    except Exception:
+        return [], "sin_renderizador"
+
+
+def extraer_fecha_pdf(archivo: Path, engine: RapidOCR, config: FechasConfig) -> OCRMatch | None:
     try:
         reader = PdfReader(str(archivo), strict=False)
-        limite = min(len(reader.pages), MAX_PDF_TEXT_PAGES)
+        limite = min(len(reader.pages), config.max_pdf_text_pages)
         for i in range(limite):
             texto = reader.pages[i].extract_text() or ""
-            fecha, cruda = extraer_fecha_desde_texto(texto)
+            fecha, cruda = extraer_fecha_desde_texto(texto, config.target_text_keywords or DEFAULT_LABEL_KEYWORDS)
             if fecha:
                 return OCRMatch(fecha, i + 1, cruda, "pdf-texto", "Fecha detectada por texto PDF", 9)
     except Exception:
         pass
 
     try:
-        paginas = convert_from_path(
-            str(archivo),
-            dpi=220,
-            first_page=1,
-            last_page=MAX_OCR_PAGES,
-            poppler_path=str(POPPLER_PATH) if POPPLER_PATH.exists() else None,
-        )
-    except Exception as error:
-        return OCRMatch("", 0, "", "pdf-error", f"No se pudo convertir PDF: {error}", 1)
+        paginas, motor_render = render_pdf_pages(archivo, config.max_ocr_pages, config.poppler_path)
+    except Exception:
+        paginas = []
+        motor_render = "sin_renderizador"
+
+    if not paginas:
+        return OCRMatch("", 0, "", "pdf-error", f"No se pudo convertir PDF ({motor_render})", 1)
 
     for i, pagina in enumerate(paginas, start=1):
         texto = ocr_en_imagen(engine, pagina)
-        fecha, cruda = extraer_fecha_desde_texto(texto)
+        fecha, cruda = extraer_fecha_desde_texto(texto, config.target_text_keywords or DEFAULT_LABEL_KEYWORDS)
         if fecha:
-            return OCRMatch(fecha, i, cruda, "pdf-rapidocr", "Fecha detectada por OCR PDF", 8)
+            return OCRMatch(fecha, i, cruda, "pdf-rapidocr", f"Fecha detectada por OCR PDF ({motor_render})", 8)
 
     return None
 
 
-def extraer_fecha_tiff(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
+def extraer_fecha_tiff(archivo: Path, engine: RapidOCR, config: FechasConfig) -> OCRMatch | None:
     try:
         with Image.open(archivo) as img:
             total = int(getattr(img, "n_frames", 1))
-            for i in range(min(total, MAX_OCR_PAGES)):
+            for i in range(min(total, config.max_ocr_pages)):
                 img.seek(i)
                 pagina = img.convert("RGB")
                 texto = ocr_en_imagen(engine, pagina)
-                fecha, cruda = extraer_fecha_desde_texto(texto)
+                fecha, cruda = extraer_fecha_desde_texto(texto, config.target_text_keywords or DEFAULT_LABEL_KEYWORDS)
                 if fecha:
                     return OCRMatch(fecha, i + 1, cruda, "tiff-rapidocr", "Fecha detectada por OCR TIFF", 8)
     except Exception as error:
@@ -284,11 +406,11 @@ def extraer_fecha_tiff(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
     return None
 
 
-def extraer_fecha_imagen(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
+def extraer_fecha_imagen(archivo: Path, engine: RapidOCR, config: FechasConfig) -> OCRMatch | None:
     try:
         with Image.open(archivo) as img:
             texto = ocr_en_imagen(engine, img.convert("RGB"))
-        fecha, cruda = extraer_fecha_desde_texto(texto)
+        fecha, cruda = extraer_fecha_desde_texto(texto, config.target_text_keywords or DEFAULT_LABEL_KEYWORDS)
         if fecha:
             return OCRMatch(fecha, 1, cruda, "imagen-rapidocr", "Fecha detectada por OCR imagen", 7)
     except Exception as error:
@@ -297,23 +419,27 @@ def extraer_fecha_imagen(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
     return None
 
 
-def procesar_archivo(archivo: Path, engine: RapidOCR) -> OCRMatch | None:
+def procesar_archivo(archivo: Path, engine: RapidOCR, config: FechasConfig) -> OCRMatch | None:
     ext = archivo.suffix.lower()
     if ext == ".pdf":
-        return extraer_fecha_pdf(archivo, engine)
+        return extraer_fecha_pdf(archivo, engine, config)
     if ext in {".tif", ".tiff"}:
-        return extraer_fecha_tiff(archivo, engine)
-    return extraer_fecha_imagen(archivo, engine)
+        return extraer_fecha_tiff(archivo, engine, config)
+    return extraer_fecha_imagen(archivo, engine, config)
 
 
-def procesar_radicado(radicado: str, carpeta: Path, engine: RapidOCR) -> ExtractionResult:
-    archivos = construir_lista_archivos(carpeta)
+def procesar_radicado(radicado: str, carpeta: Path, engine: RapidOCR, config: FechasConfig) -> ExtractionResult:
+    archivos = construir_lista_archivos(
+        carpeta,
+        config.max_files_per_radicado,
+        config.file_name_keywords or DEFAULT_FILE_KEYWORDS,
+    )
     if not archivos:
         return ExtractionResult(radicado, "", 1, "sin_archivos", "", "", 0, "", "No hay archivos soportados")
 
     razones: list[str] = []
     for archivo in archivos:
-        match = procesar_archivo(archivo, engine)
+        match = procesar_archivo(archivo, engine, config)
         if match and match.fecha:
             return ExtractionResult(
                 radicado=radicado,
@@ -472,21 +598,85 @@ def escribir_excel_detalle(resultados: list[ExtractionResult], salida: Path) -> 
     wb.save(salida)
 
 
-def main() -> None:
-    if not ROOT_PATH.exists():
-        raise FileNotFoundError(f"No existe la ruta raiz: {ROOT_PATH}")
-    if not TARGET_RADICADOS_PATH.exists():
-        raise FileNotFoundError(f"No existe archivo de radicados: {TARGET_RADICADOS_PATH}")
+def format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    minutos, segs = divmod(total, 60)
+    horas, minutos = divmod(minutos, 60)
+    if horas:
+        return f"{horas:02d}:{minutos:02d}:{segs:02d}"
+    return f"{minutos:02d}:{segs:02d}"
 
-    objetivos = cargar_radicados_objetivo(TARGET_RADICADOS_PATH)
-    seed = cargar_resultados_seed()
+
+def classify_speed(avg_seconds_per_item: float) -> str:
+    if avg_seconds_per_item <= 2.5:
+        return "muy rapido"
+    if avg_seconds_per_item <= 5:
+        return "rapido"
+    if avg_seconds_per_item <= 10:
+        return "medio"
+    return "lento"
+
+
+def run_fechas(
+    config: FechasConfig,
+    on_log: Callable[[str], None] | None = None,
+    on_progress: Callable[[ProgressInfo], None] | None = None,
+) -> list[ExtractionResult]:
+    log = on_log or print
+
+    if not config.root_path.exists():
+        raise FileNotFoundError(f"No existe la ruta raiz: {config.root_path}")
+    if not config.target_radicados_path.exists():
+        raise FileNotFoundError(f"No existe archivo de radicados: {config.target_radicados_path}")
+
+    objetivos = cargar_radicados_objetivo(config.target_radicados_path)
+    seed = cargar_resultados_seed_desde_rutas(config.seed_result_paths)
     engine = RapidOCR()
 
     pendientes_reales = [rad for rad in objetivos if not seed.get(rad)]
+    encontrados_seed = len(objetivos) - len(pendientes_reales)
+    start_time = time.perf_counter()
 
-    print(f"Radicados objetivo: {len(objetivos)}")
-    print(f"Ya resueltos por seed JS/CSV: {len(objetivos) - len(pendientes_reales)}")
-    print(f"Pendientes OCR Python: {len(pendientes_reales)}")
+    log(f"Radicados objetivo: {len(objetivos)}")
+    log(f"Ya resueltos por seed JS/CSV: {encontrados_seed}")
+    log(f"Pendientes OCR Python: {len(pendientes_reales)}")
+
+    def emitir_progreso(current_radicado: str = "") -> None:
+        if not on_progress:
+            return
+        procesados = 0
+        encontrados_ocr = 0
+        no_encontrados = 0
+        for rad in pendientes_reales:
+            item = mapa.get(rad)
+            if not item or item.estado == "pendiente":
+                continue
+            procesados += 1
+            if item.estado == "ok":
+                encontrados_ocr += 1
+            else:
+                no_encontrados += 1
+
+        elapsed = time.perf_counter() - start_time
+        avg = elapsed / procesados if procesados else 0.0
+        restantes = max(0, len(pendientes_reales) - procesados)
+        eta = avg * restantes if avg else 0.0
+        on_progress(
+            ProgressInfo(
+                total_objetivos=len(objetivos),
+                total_pendientes_ocr=len(pendientes_reales),
+                procesados_ocr=procesados,
+                encontrados_exactos=encontrados_seed + encontrados_ocr,
+                encontrados_seed=encontrados_seed,
+                no_encontrados=no_encontrados,
+                restantes_ocr=restantes,
+                elapsed_seconds=elapsed,
+                average_seconds_per_item=avg,
+                eta_seconds=eta,
+                speed_label=classify_speed(avg),
+                current_radicado=current_radicado,
+            )
+        )
 
     mapa: dict[str, ExtractionResult] = {}
     for radicado in objetivos:
@@ -521,12 +711,13 @@ def main() -> None:
         )
 
     completar_fechas_faltantes(objetivos, mapa)
-    escribir_csv([mapa[rad] for rad in objetivos], OUTPUT_CSV_PATH)
+    escribir_csv([mapa[rad] for rad in objetivos], config.output_csv_path)
+    emitir_progreso()
 
     total = len(pendientes_reales)
     for idx, radicado in enumerate(pendientes_reales, start=1):
-        carpeta = ROOT_PATH / radicado
-        print(f"[{idx}/{total}] {radicado}")
+        carpeta = config.root_path / radicado
+        log(f"[{idx}/{total}] {radicado}")
 
         if not carpeta.exists() or not carpeta.is_dir():
             mapa[radicado] = ExtractionResult(
@@ -540,9 +731,17 @@ def main() -> None:
                 "",
                 "No existe carpeta del radicado",
             )
+            emitir_progreso(radicado)
             continue
 
-        mapa[radicado] = procesar_radicado(radicado, carpeta, engine)
+        mapa[radicado] = procesar_radicado(radicado, carpeta, engine, config)
+        item = mapa[radicado]
+        if item.estado == "ok":
+            log(f"    -> encontrada: {item.ingreso} | score={item.score_confianza} | metodo={item.metodo}")
+        else:
+            log(f"    -> no encontrada | estado={item.estado} | motivo={item.motivo or 'sin coincidencia'}")
+
+        emitir_progreso(radicado)
 
         if idx % 10 == 0 or idx == total:
             completar_fechas_faltantes(objetivos, mapa)
@@ -550,7 +749,7 @@ def main() -> None:
                 mapa.get(rad, ExtractionResult(rad, "1/01/24", 1, "aproximada", "fallback-global", "", 0, "1/01/24", "Fallback"))
                 for rad in objetivos
             ]
-            escribir_csv(parciales, OUTPUT_CSV_PATH)
+            escribir_csv(parciales, config.output_csv_path)
 
     completar_fechas_faltantes(objetivos, mapa)
 
@@ -562,19 +761,74 @@ def main() -> None:
         for rad in objetivos
     ]
 
-    escribir_csv(resultados, OUTPUT_CSV_PATH)
-    escribir_excel_detalle(resultados, OUTPUT_EXCEL_PATH)
+    escribir_csv(resultados, config.output_csv_path)
+    escribir_excel_detalle(resultados, config.output_excel_path)
 
     exactas = sum(1 for r in resultados if r.estado in {"ok", "seed"})
     aproximadas = sum(1 for r in resultados if r.estado == "aproximada")
     promedio = round(sum(r.score_confianza for r in resultados) / max(1, len(resultados)), 2)
+    elapsed_total = time.perf_counter() - start_time
+    avg_total = elapsed_total / total if total else 0.0
+    log(f"Tiempo total: {format_duration(elapsed_total)}")
+    log(f"Promedio por radicado OCR: {avg_total:.2f}s ({classify_speed(avg_total)})")
 
-    print(f"Total radicados: {len(resultados)}")
-    print(f"Exactas (OCR/seed): {exactas}")
-    print(f"Aproximadas: {aproximadas}")
-    print(f"Score promedio: {promedio}")
-    print(f"CSV generado: {OUTPUT_CSV_PATH}")
-    print(f"Excel detalle: {OUTPUT_EXCEL_PATH}")
+    log(f"Total radicados: {len(resultados)}")
+    log(f"Exactas (OCR/seed): {exactas}")
+    log(f"Aproximadas: {aproximadas}")
+    log(f"Score promedio: {promedio}")
+    log(f"CSV generado: {config.output_csv_path}")
+    log(f"Excel detalle: {config.output_excel_path}")
+    emitir_progreso()
+    return resultados
+
+
+def construir_config_desde_args() -> FechasConfig:
+    parser = argparse.ArgumentParser(description="Extractor de fechas de ingreso")
+    parser.add_argument("--root", default=str(ROOT_PATH), help="Ruta raiz con carpetas por radicado")
+    parser.add_argument("--radicados", default=str(TARGET_RADICADOS_PATH), help="Archivo con radicados objetivo")
+    parser.add_argument("--out-csv", default=str(OUTPUT_CSV_PATH), help="Ruta salida CSV")
+    parser.add_argument("--out-excel", default=str(OUTPUT_EXCEL_PATH), help="Ruta salida Excel detalle")
+    parser.add_argument("--seed", action="append", default=None, help="Ruta adicional de resultados seed (puede repetirse)")
+    parser.add_argument("--max-pdf-text-pages", type=int, default=MAX_PDF_TEXT_PAGES)
+    parser.add_argument("--max-ocr-pages", type=int, default=MAX_OCR_PAGES)
+    parser.add_argument("--max-files", type=int, default=MAX_FILES_PER_RADICADO)
+    parser.add_argument(
+        "--file-keywords",
+        default=",".join(DEFAULT_FILE_KEYWORDS),
+        help="Keywords de nombre de archivo separados por coma (minimo 3)",
+    )
+    parser.add_argument(
+        "--label-keywords",
+        default=",".join(DEFAULT_LABEL_KEYWORDS),
+        help="Keywords de texto a buscar cerca de la fecha, separados por coma",
+    )
+    parser.add_argument("--poppler", default=str(POPPLER_PATH), help="Ruta de poppler (opcional)")
+    args = parser.parse_args()
+
+    seed_paths = [Path(p) for p in (args.seed or [])] or SEED_RESULT_PATHS
+    file_keywords = normalizar_lista_keywords(args.file_keywords)
+    if len(file_keywords) < 3:
+        raise ValueError("Debes indicar minimo 3 keywords en --file-keywords")
+    label_keywords = normalizar_lista_keywords(args.label_keywords) or DEFAULT_LABEL_KEYWORDS
+
+    return FechasConfig(
+        root_path=Path(args.root),
+        target_radicados_path=Path(args.radicados),
+        output_csv_path=Path(args.out_csv),
+        output_excel_path=Path(args.out_excel),
+        seed_result_paths=seed_paths,
+        max_pdf_text_pages=max(1, args.max_pdf_text_pages),
+        max_ocr_pages=max(1, args.max_ocr_pages),
+        max_files_per_radicado=max(1, args.max_files),
+        poppler_path=Path(args.poppler),
+        file_name_keywords=file_keywords,
+        target_text_keywords=label_keywords,
+    )
+
+
+def main() -> None:
+    config = construir_config_desde_args()
+    run_fechas(config)
 
 
 if __name__ == "__main__":
